@@ -1,0 +1,132 @@
+name: M3U generator
+
+on:
+  schedule:
+    - cron: '0 */3 * * *' # every 3 hours (UTC)
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install ffmpeg + yt-dlp
+        shell: bash
+        run: |
+            set -Eeuo pipefail
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+            python -m pip install --upgrade pip
+            pip install "yt-dlp>=2024.04.09,<2026.0"
+
+      - name: Generate M3U + EPG (auto-refreshing link)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python - <<'PY'
+          import subprocess, json, shlex, sys
+          from pathlib import Path
+          from datetime import datetime, timedelta, timezone
+          from xml.sax.saxutils import escape
+
+          # Stable info for your channel/stream
+          NAME  = "The Good Life Radio – Relax / Deep House / Chillout (24/7)"
+          CID   = "TheGoodLifeRadio.yt"  # must match epg.xml <channel id>
+          GROUP = "Deep House"
+          URL   = "https://www.youtube.com/watch?v=36YnV9STBqc"
+
+          # Build a RAW base to your repo files
+          USER   = "${{ github.repository_owner }}"
+          REPO   = "${{ github.event.repository.name }}"
+          BRANCH = "${{ github.event.repository.default_branch }}"
+          RAW    = f"https://raw.githubusercontent.com/{USER}/{REPO}/{BRANCH}"
+
+          def run(cmd):
+              return subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT, text=True).strip()
+
+          def resolve_hls(u: str) -> str:
+              fmts = [
+                "best[protocol^=m3u8][vcodec!=none]+bestaudio/best[protocol^=m3u8]/best",
+                "bv*+ba/b[protocol^=m3u8]/b",
+                "best"
+              ]
+              for f in fmts:
+                  try:
+                      out = run(f"yt-dlp --no-warnings -g -f {shlex.quote(f)} {shlex.quote(u)}")
+                      lines = [ln for ln in (ln.strip() for ln in out.splitlines()) if ln]
+                      for ln in lines:
+                          if ".m3u8" in ln: return ln
+                      if lines: return lines[-1]
+                  except subprocess.CalledProcessError:
+                      pass
+              # JSON probe fallback
+              try:
+                  data = json.loads(run(f"yt-dlp -J {shlex.quote(u)}"))
+                  fmts = data.get("formats") or []
+                  hls = [f for f in fmts if "m3u8" in (f.get("protocol") or "") or "m3u8" in (f.get("ext") or "")]
+                  hls.sort(key=lambda f: (0 if f.get("vcodec") not in (None,"none") else 1, f.get("tbr") or 0), reverse=True)
+                  for f in hls:
+                      if f.get("url"): return f["url"]
+                      if f.get("manifest_url"): return f["manifest_url"]
+              except Exception:
+                  pass
+              return ""
+
+          stream = resolve_hls(URL)
+          if not stream:
+              print("Failed to resolve stream URL", file=sys.stderr); sys.exit(2)
+
+          # Write EPG for the next 24h (XMLTV format)
+          now = datetime.now(timezone.utc); stop = now + timedelta(hours=24)
+          fmt = lambda dt: dt.strftime("%Y%m%d%H%M%S") + " +0000"
+          epg = (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<tv generator-info-name="AutoM3U">\n'
+            f'  <channel id="{escape(CID)}">\n'
+            f'    <display-name>{escape(NAME)}</display-name>\n'
+            f'  </channel>\n'
+            f'  <programme start="{fmt(now)}" stop="{fmt(stop)}" channel="{escape(CID)}">\n'
+            f'    <title>{escape(NAME)} (Live)</title>\n'
+            f'    <desc>Auto-generated EPG for a continuous live stream.</desc>\n'
+            f'  </programme>\n'
+            '</tv>\n'
+          )
+          Path("epg.xml").write_text(epg, encoding="utf-8", newline="\n")
+
+          # Playlist with EPG header that TiviMate understands
+          m3u = (
+            f'#EXTM3U url-tvg="{RAW}/epg.xml" x-tvg-url="{RAW}/epg.xml"\n'
+            f'#EXTINF:-1 tvg-id="{escape(CID)}" tvg-name="{escape(NAME)}" group-title="{escape(GROUP)}",{NAME}\n'
+            f'{stream}\n'
+          )
+          Path("streams.m3u").write_text(m3u, encoding="utf-8", newline="\n")
+          print("Wrote streams.m3u and epg.xml")
+          PY
+
+      - name: Validate & commit if changed
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          grep -q '^#EXTM3U' streams.m3u
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name  "github-actions[bot]"
+          git add streams.m3u epg.xml
+          if ! git diff --cached --quiet; then
+            git commit -m "Auto-refresh playlist/epg"
+            git push
+          else
+            echo "No changes."
+          fi
