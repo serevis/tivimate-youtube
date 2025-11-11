@@ -1,0 +1,73 @@
+name: M3U generator
+
+on:
+  schedule:
+    - cron: '0 */3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install yt-dlp + ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python3 -m pip install --upgrade pip
+          pip install yt-dlp
+
+      - name: Generate playlist + epg
+        run: |
+          python3 - << 'EOF'
+          import subprocess, sys, json
+          from datetime import datetime, timedelta, timezone
+          from pathlib import Path
+
+          URL = "https://www.youtube.com/watch?v=36YnV9STBqc"
+          NAME = "The Good Life Radio – Relax / Deep House / Chillout (24/7)"
+          CID = "GoodLife.yt"
+          GROUP = "Deep House"
+
+          def run(cmd):
+              return subprocess.check_output(cmd, shell=True, text=True)
+
+          # Fetch fresh HLS URL
+          hls = run(f"yt-dlp -g -f 'best[protocol^=m3u8]/best' {URL}").strip()
+
+          # Make files
+          Path("streams.m3u").write_text(
+              f'#EXTM3U url-tvg="https://raw.githubusercontent.com/serevis/tivimate-youtube/main/epg.xml"\n'
+              f'#EXTINF:-1 tvg-id="{CID}" group-title="{GROUP}",{NAME}\n'
+              f'{hls}\n',
+              encoding="utf-8"
+          )
+
+          now = datetime.now(timezone.utc)
+          stop = now + timedelta(hours=24)
+          Path("epg.xml").write_text(
+              f'<?xml version="1.0" encoding="UTF-8"?>\n'
+              f'<tv>\n'
+              f'  <channel id="{CID}">\n'
+              f'    <display-name>{NAME}</display-name>\n'
+              f'  </channel>\n'
+              f'  <programme start="{now:%Y%m%d%H%M%S} +0000" stop="{stop:%Y%m%d%H%M%S} +0000" channel="{CID}">\n'
+              f'    <title>{NAME} (Live)</title>\n'
+              f'    <desc>Auto-generated epg.</desc>\n'
+              f'  </programme>\n'
+              f'</tv>\n',
+              encoding="utf-8"
+          )
+          EOF
+
+      - name: Commit & Push
+        run: |
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add streams.m3u epg.xml
+          git commit -m "update playlist" || echo "No changes"
+          git push
