@@ -2,7 +2,7 @@ name: M3U generator
 
 on:
   schedule:
-    - cron: '0 */3 * * *'
+    - cron: "0 */3 * * *"  # every 3 hours (UTC)
   workflow_dispatch:
 
 permissions:
@@ -12,62 +12,118 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Install yt-dlp + ffmpeg
+      - name: Install ffmpeg + yt-dlp (with version logs)
+        shell: bash
         run: |
+          set -Eeuo pipefail
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg jq
           python3 -m pip install --upgrade pip
-          pip install yt-dlp
+          python3 -m pip install "yt-dlp>=2024.04.09,<2026.0"
+          echo "== versions =="
+          ffmpeg -version | head -n 1 || true
+          python3 - <<'PY'
+          import yt_dlp, sys
+          print("yt-dlp", yt_dlp.version.__version__)
+          PY
 
-      - name: Generate playlist + epg
+      - name: Generate playlist + EPG (verbose)
+        shell: bash
         run: |
-          python3 - << 'EOF'
-          import subprocess, sys, json
-          from datetime import datetime, timedelta, timezone
-          from pathlib import Path
+          set -Eeuo pipefail
+          URL="https://www.youtube.com/watch?v=36YnV9STBqc"
+          NAME="The Good Life Radio – Relax / Deep House / Chillout (24/7)"
+          CID="TheGoodLifeRadio.yt"
+          GROUP="Deep House"
 
-          URL = "https://www.youtube.com/watch?v=36YnV9STBqc"
-          NAME = "The Good Life Radio – Relax / Deep House / Chillout (24/7)"
-          CID = "GoodLife.yt"
-          GROUP = "Deep House"
+          RAW="https://raw.githubusercontent.com/${{ github.repository_owner }}/${{ github.event.repository.name }}/${{ github.event.repository.default_branch }}"
+          echo "RAW base: $RAW"
 
-          def run(cmd):
-              return subprocess.check_output(cmd, shell=True, text=True)
+          resolve_hls () {
+            local fmt out last
+            for fmt in \
+              "best[protocol^=m3u8][vcodec!=none]+bestaudio/best[protocol^=m3u8]/best" \
+              "bv*+ba/b[protocol^=m3u8]/b" \
+              "best"
+            do
+              echo "Trying format: $fmt"
+              if out=$(yt-dlp --no-warnings -g -f "$fmt" "$URL" 2>&1); then
+                echo "$out" | sed -n '1,5p'
+                while IFS= read -r line; do
+                  [[ -n "$line" ]] || continue
+                  if [[ "$line" == *".m3u8"* ]]; then
+                    echo "$line"; return 0
+                  fi
+                  last="$line"
+                done <<< "$out"
+                if [[ -n "${last:-}" ]]; then echo "$last"; return 0; fi
+              else
+                echo "yt-dlp -g failed for $fmt:"
+                echo "$out" >&2
+              fi
+            done
+            echo "JSON probe fallback…"
+            out=$(yt-dlp -J "$URL" 2>/dev/null || true)
+            if [[ -n "$out" ]]; then
+              echo "$out" | jq -r '
+                (.formats // [])
+                | map(select((.protocol // "") | contains("m3u8") or (.ext // "") | contains("m3u8")))
+                | sort_by([(if (.vcodec == null or .vcodec == "none") then 1 else 0 end), (.tbr // 0)]) | reverse
+                | .[0] | (.url // .manifest_url) // empty
+              '
+            fi
+          }
 
-          # Fetch fresh HLS URL
-          hls = run(f"yt-dlp -g -f 'best[protocol^=m3u8]/best' {URL}").strip()
+          # retry a few times in case YT is flaky
+          HLS=""
+          for i in 1 2 3; do
+            HLS="$(resolve_hls || true)"
+            [[ -n "$HLS" ]] && break
+            echo "Resolve attempt $i failed; sleep 5s and retry…"
+            sleep 5
+          done
+          [[ -n "$HLS" ]] || { echo "ERROR: failed to resolve playable HLS URL"; exit 2; }
+          echo "Resolved HLS (len=$(printf %s "$HLS" | wc -c))"
 
-          # Make files
-          Path("streams.m3u").write_text(
-              f'#EXTM3U url-tvg="https://raw.githubusercontent.com/serevis/tivimate-youtube/main/epg.xml"\n'
-              f'#EXTINF:-1 tvg-id="{CID}" group-title="{GROUP}",{NAME}\n'
-              f'{hls}\n',
-              encoding="utf-8"
-          )
+          # Write EPG for next 24h (XMLTV)
+          now_utc="$(date -u +%Y%m%d%H%M%S)"
+          stop_utc="$(date -u -d '+24 hours' +%Y%m%d%H%M%S)"
+          cat > epg.xml <<XML
+<?xml version="1.0" encoding="UTF-8"?>
+<tv generator-info-name="AutoM3U">
+  <channel id="${CID}">
+    <display-name>${NAME}</display-name>
+  </channel>
+  <programme start="${now_utc} +0000" stop="${stop_utc} +0000" channel="${CID}">
+    <title>${NAME} (Live)</title>
+    <desc>Auto-generated EPG for a continuous live stream.</desc>
+  </programme>
+</tv>
+XML
 
-          now = datetime.now(timezone.utc)
-          stop = now + timedelta(hours=24)
-          Path("epg.xml").write_text(
-              f'<?xml version="1.0" encoding="UTF-8"?>\n'
-              f'<tv>\n'
-              f'  <channel id="{CID}">\n'
-              f'    <display-name>{NAME}</display-name>\n'
-              f'  </channel>\n'
-              f'  <programme start="{now:%Y%m%d%H%M%S} +0000" stop="{stop:%Y%m%d%H%M%S} +0000" channel="{CID}">\n'
-              f'    <title>{NAME} (Live)</title>\n'
-              f'    <desc>Auto-generated epg.</desc>\n'
-              f'  </programme>\n'
-              f'</tv>\n',
-              encoding="utf-8"
-          )
-          EOF
+          # TiviMate-friendly playlist header points to EPG
+          cat > streams.m3u <<M3U
+#EXTM3U url-tvg="${RAW}/epg.xml" x-tvg-url="${RAW}/epg.xml"
+#EXTINF:-1 tvg-id="${CID}" tvg-name="${NAME}" group-title="${GROUP}",${NAME}
+${HLS}
+M3U
 
-      - name: Commit & Push
+          echo "Wrote streams.m3u and epg.xml"
+          head -n 3 streams.m3u
+
+      - name: Commit & push if changed
+        shell: bash
         run: |
+          set -Eeuo pipefail
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git add streams.m3u epg.xml
-          git commit -m "update playlist" || echo "No changes"
-          git push
+          if ! git diff --cached --quiet; then
+            git commit -m "Auto-refresh playlist/EPG"
+            git push
+          else
+            echo "No changes to commit."
+          fi
